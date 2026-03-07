@@ -73,6 +73,13 @@ _video_res = G_config['VIDEO_RES']
 _video_bitrate = 5000 # TODO: Persist in the configuration file
 _trans_enable = G_config['VIDEO_TRANS_ENABLE']
 _trans_time = G_config['VIDEO_TRANS_TIME']
+_parallel_workers = int(G_config.get('VIDEO_PARALLEL_WORKERS', 1))
+if _parallel_workers < 1:
+    _parallel_workers = 1
+codec_options = ["libx264", "h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf"]
+_video_codec = G_config.get('VIDEO_CODEC', 'libx264')
+if _video_codec not in codec_options:
+    _video_codec = "libx264"
 
 options = ["Generate individual clips", "Generate a full video"]
 with st.container(border=True):
@@ -97,6 +104,24 @@ with st.container(border=True):
 with st.container(border=True):
     st.write("Video bitrate (kbps)")  
     v_bitrate = st.number_input("Video bitrate", min_value=1000, max_value=10000, value=_video_bitrate)
+with st.container(border=True):
+    st.write("Video encoder")
+    v_codec = st.selectbox(
+        "Video codec",
+        options=codec_options,
+        index=codec_options.index(_video_codec),
+        help="Use hardware encoder if available: NVENC (NVIDIA), QSV (Intel), AMF (AMD).",
+    )
+with st.container(border=True):
+    st.write("Parallel rendering")
+    parallel_workers = st.number_input(
+        "Parallel workers (clip mode)",
+        min_value=1,
+        max_value=max(1, os.cpu_count() or 1),
+        value=min(_parallel_workers, max(1, os.cpu_count() or 1)),
+        step=1,
+        help="Only affects per-clip rendering. Higher values use more CPU/RAM.",
+    )
 
 v_mode_index = options.index(mode_str)
 v_bitrate_kbps = f"{v_bitrate}k"
@@ -117,6 +142,8 @@ def save_video_render_config():
     G_config['ONLY_GENERATE_CLIPS'] = v_mode_index == 0
     G_config['VIDEO_RES'] = (v_res_width, v_res_height)
     G_config['VIDEO_BITRATE'] = v_bitrate
+    G_config['VIDEO_CODEC'] = v_codec
+    G_config['VIDEO_PARALLEL_WORKERS'] = int(parallel_workers)
     G_config['VIDEO_TRANS_ENABLE'] = trans_enable
     G_config['VIDEO_TRANS_TIME'] = trans_time
     write_global_config(G_config)
@@ -139,7 +166,9 @@ if st.button("Start rendering videos"):
                                            video_bitrate=v_bitrate_kbps,
                                            auto_add_transition=False,
                                            trans_time=trans_time,
-                                           force_render=force_render_clip)
+                                           force_render=force_render_clip,
+                                           video_codec=v_codec,
+                                           parallel_workers=int(parallel_workers))
                     st.info("Batch clip rendering started. Watch the console window for progress.")
             st.success("Clip rendering complete! Use the button below to open the output folder.")
         except Exception as e:
@@ -159,7 +188,8 @@ if st.button("Start rendering videos"):
                                                              video_bitrate=v_bitrate_kbps,
                                                              video_trans_enable=trans_enable, 
                                                              video_trans_time=trans_time, 
-                                                             full_last_clip=False)
+                                                             full_last_clip=False,
+                                                             video_codec=v_codec)
                     st.write(f"Result: {output_info['info']}")
             st.success("Full video rendering complete! Use the button below to open the output folder.")
         except Exception as e:
@@ -190,7 +220,9 @@ with st.container(border=True):
                 video_bitrate=v_bitrate_kbps,
                 auto_add_transition=trans_enable, 
                 trans_time=trans_time,
-                force_render=force_render_clip
+                force_render=force_render_clip,
+                video_codec=v_codec,
+                parallel_workers=int(parallel_workers)
             )
             st.info("Batch clip rendering started. Watch the console window for progress.")
         with st.spinner("Concatenating clips into a full video..."):
@@ -226,7 +258,9 @@ with st.container(border=True):
                     video_bitrate=v_bitrate_kbps,
                     auto_add_transition=trans_enable,
                     trans_time=trans_time,
-                    force_render=force_render_clip
+                    force_render=force_render_clip,
+                    video_codec=v_codec,
+                    parallel_workers=int(parallel_workers)
                 )
                 st.info("Batch clip rendering started. Watch the console window for progress.")
             with st.spinner("Concatenating video with ffmpeg-concat..."):

@@ -314,6 +314,7 @@ if video_config:
             os.makedirs(video_output_path, exist_ok=True)
         v_res = G_config['VIDEO_RES']
         v_bitrate_kbps = f"{G_config['VIDEO_BITRATE']}k"
+        v_codec = G_config.get('VIDEO_CODEC', 'libx264')
         target_config = video_config["main"][st.session_state.current_index]
         target_video_filename = get_output_video_name_with_timestamp(target_config['id'])
         if st.button("Export video"):
@@ -325,7 +326,8 @@ if video_config:
                     video_file_name=target_video_filename,
                     video_output_path=video_output_path,
                     video_res=v_res,
-                    video_bitrate=v_bitrate_kbps
+                    video_bitrate=v_bitrate_kbps,
+                    video_codec=v_codec
                 )
             if res['status'] == 'success':
                 st.success(res['info'])

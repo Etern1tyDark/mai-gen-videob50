@@ -2,12 +2,33 @@ import os
 import numpy as np
 import subprocess
 import traceback
-from PIL import Image, ImageFilter
-from moviepy import VideoFileClip, ImageClip, TextClip, AudioFileClip, CompositeVideoClip, CompositeAudioClip, concatenate_videoclips
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
+from PIL import Image, ImageFilter, ImageDraw, ImageFont
+from moviepy import VideoFileClip, ImageClip, ColorClip, AudioFileClip, CompositeVideoClip, CompositeAudioClip, concatenate_videoclips
 from moviepy import vfx, afx
 from utils.ImageUtils import load_music_jacket
 from utils.PageUtils import load_style_config
 from utils.VisionUtils import find_circle_center, draw_center_marker
+
+
+FALLBACK_SYMBOL_FONT_CANDIDATES = [
+    "C:/Windows/Fonts/seguisym.ttf",
+    "/mnt/c/Windows/Fonts/seguisym.ttf",
+]
+FALLBACK_SYMBOL_CHARS = {"⯪", "⯨"}
+FALLBACK_SYMBOL_FONT_SCALE = 1.28
+TEXT_RENDER_SCALE = 0.90
+TEXT_LAYOUT_BASELINE_SCALE = 0.85
+TEXT_LAYOUT_COMPENSATION = TEXT_LAYOUT_BASELINE_SCALE / TEXT_RENDER_SCALE
+HW_ACCEL_CODECS = {
+    "h264_nvenc",
+    "hevc_nvenc",
+    "h264_qsv",
+    "hevc_qsv",
+    "h264_amf",
+    "hevc_amf",
+}
 
 
 def get_splited_text(text, text_max_bytes=60):
@@ -82,6 +103,124 @@ def create_blank_image(width, height, color=(0, 0, 0, 0)):
     return np.array(image)
 
 
+def _load_symbol_fallback_font(font_size):
+    fallback_size = max(1, int(round(font_size * FALLBACK_SYMBOL_FONT_SCALE)))
+    for path in FALLBACK_SYMBOL_FONT_CANDIDATES:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, fallback_size)
+            except Exception:
+                continue
+    return None
+
+
+def _char_width(font, char):
+    try:
+        width = font.getlength(char)
+        if width > 0:
+            return width
+    except Exception:
+        pass
+
+    bbox = font.getbbox(char)
+    return max(0, bbox[2] - bbox[0])
+
+
+def _char_height(font, char="A"):
+    bbox = font.getbbox(char)
+    return max(1, bbox[3] - bbox[1])
+
+
+def _font_metrics(font):
+    try:
+        ascent, descent = font.getmetrics()
+        return int(ascent), int(descent)
+    except Exception:
+        h = _char_height(font)
+        return int(h * 0.8), max(1, int(h * 0.2))
+
+
+def create_text_image_clip(text, font_path, font_size, duration,
+                           margin=(20, 20), interline=0,
+                           text_align="left", color="white",
+                           stroke_color=None, stroke_width=0):
+    primary_font = ImageFont.truetype(font_path, font_size)
+    fallback_font = _load_symbol_fallback_font(font_size)
+
+    lines = text.split("\n") if text else [""]
+    line_infos = []
+    fallback_downward_offset = max(1, int(round(font_size * 0.05)))
+
+    # Pre-compute line widths using per-character fallback selection.
+    for line in lines:
+        segments = []
+        pre_segments = []
+        width = 0.0
+        line_ascent, line_descent = _font_metrics(primary_font)
+
+        for char in line:
+            use_fallback = fallback_font is not None and char in FALLBACK_SYMBOL_CHARS
+            font = fallback_font if use_fallback else primary_font
+            char_w = _char_width(font, char)
+            char_ascent, char_descent = _font_metrics(font)
+
+            pre_segments.append((char, font, char_w, char_ascent, use_fallback))
+            width += char_w
+            line_ascent = max(line_ascent, char_ascent)
+            line_descent = max(line_descent, char_descent)
+
+        for char, font, char_w, char_ascent, use_fallback in pre_segments:
+            y_offset = line_ascent - char_ascent
+            if use_fallback:
+                y_offset += fallback_downward_offset
+            segments.append((char, font, char_w, y_offset))
+
+        line_infos.append({
+            "segments": segments,
+            "width": int(np.ceil(width)),
+            "height": line_ascent + line_descent,
+        })
+
+    max_line_width = max((info["width"] for info in line_infos), default=0)
+    total_text_height = 0
+    for i, info in enumerate(line_infos):
+        total_text_height += info["height"]
+        if i < len(line_infos) - 1:
+            total_text_height += int(round(interline))
+
+    pad_x = margin[0] + int(stroke_width)
+    pad_y = margin[1] + int(stroke_width)
+    image_width = max(1, max_line_width + pad_x * 2)
+    image_height = max(1, total_text_height + pad_y * 2)
+
+    image = Image.new("RGBA", (image_width, image_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+
+    y = pad_y
+    for info in line_infos:
+        if text_align == "center":
+            x = pad_x + (max_line_width - info["width"]) / 2
+        elif text_align == "right":
+            x = pad_x + (max_line_width - info["width"])
+        else:
+            x = pad_x
+
+        for char, font, char_w, y_offset in info["segments"]:
+            draw.text(
+                (x, y + y_offset),
+                char,
+                font=font,
+                fill=color,
+                stroke_width=int(stroke_width),
+                stroke_fill=stroke_color,
+            )
+            x += char_w
+
+        y += info["height"] + int(round(interline))
+
+    return ImageClip(np.array(image)).with_duration(duration)
+
+
 def normalize_audio_volume(clip, target_dbfs=-20):
     """均衡化音频响度到指定的分贝值"""
     if clip.audio is None:
@@ -125,6 +264,22 @@ def normalize_audio_volume(clip, target_dbfs=-20):
         return clip
 
 
+def get_writer_kwargs(video_bitrate, video_codec="libx264"):
+    codec = (video_codec or "libx264").strip()
+    kwargs = {
+        "fps": 30,
+        "bitrate": video_bitrate,
+        "codec": codec,
+    }
+
+    # Hardware encoders use different preset semantics; keep parameters minimal.
+    if codec not in HW_ACCEL_CODECS:
+        kwargs["threads"] = 4
+        kwargs["preset"] = "ultrafast"
+
+    return kwargs
+
+
 def create_info_segment(clip_config, style_config, resolution):
     print(f"正在合成视频片段: {clip_config['id']}")
 
@@ -134,9 +289,9 @@ def create_info_segment(clip_config, style_config, resolution):
     intro_bgm_path = style_config['asset_paths']['intro_bgm']
 
     base_text_size = style_config['intro_text_style']['font_size']
-    text_size = max(12, int(base_text_size * 0.85))
-    inline_max_len = style_config['intro_text_style']['inline_max_chara'] * 2
-    interline_size = style_config['intro_text_style']['interline']
+    text_size = max(12, int(base_text_size * TEXT_RENDER_SCALE))
+    inline_max_len = max(10, int(style_config['intro_text_style']['inline_max_chara'] * 2 * TEXT_LAYOUT_COMPENSATION))
+    interline_size = style_config['intro_text_style']['interline'] * TEXT_LAYOUT_COMPENSATION
     horizontal_align = style_config['intro_text_style']['horizontal_align']
     text_color = style_config['intro_text_style']['font_color']
     enable_stroke = style_config['intro_text_style']['enable_stroke']
@@ -154,25 +309,31 @@ def create_info_segment(clip_config, style_config, resolution):
 
     # 创建文字
     text_list = get_splited_text(clip_config['text'], text_max_bytes=inline_max_len)
-    txt_clip = TextClip(font=font_path, text="\n".join(text_list),
-                        method = "label",
-                        font_size=text_size,
-                        margin=(20, 20),
-                        interline=interline_size,
-                        text_align=horizontal_align,
-                        vertical_align="top",
-                        color=text_color,
-                        stroke_color = None if not enable_stroke else stroke_color,
-                        stroke_width = 0 if not enable_stroke else stroke_width,
-                        duration=clip_config['duration'])
+    txt_clip = create_text_image_clip(
+        text="\n".join(text_list),
+        font_path=font_path,
+        font_size=text_size,
+        margin=(20, 20),
+        interline=interline_size,
+        text_align=horizontal_align,
+        color=text_color,
+        stroke_color=None if not enable_stroke else stroke_color,
+        stroke_width=0 if not enable_stroke else stroke_width,
+        duration=clip_config['duration'],
+    )
     
     addtional_text = "【本视频由mai-genVb50视频生成器生成】"
-    addtional_txt_clip = TextClip(font=font_path, text=addtional_text,
-                        method = "label",
-                        font_size=18,
-                        vertical_align="bottom",
-                        color="white",
-                        duration=clip_config['duration']
+    addtional_txt_clip = create_text_image_clip(
+        text=addtional_text,
+        font_path=font_path,
+        font_size=18,
+        margin=(0, 0),
+        interline=0,
+        text_align="left",
+        color="white",
+        stroke_color=None,
+        stroke_width=0,
+        duration=clip_config['duration'],
     )
     
     text_pos = (int(0.16 * resolution[0]), int(0.18 * resolution[1]))
@@ -201,9 +362,9 @@ def create_video_segment(clip_config, style_config, resolution):
     # 配置文字样式选项
     font_path = style_config['asset_paths']['comment_font']
     base_text_size = style_config['content_text_style']['font_size']
-    text_size = max(12, int(base_text_size * 0.85))
-    inline_max_len = style_config['content_text_style']['inline_max_chara'] * 2
-    interline_size = style_config['content_text_style']['interline']
+    text_size = max(12, int(base_text_size * TEXT_RENDER_SCALE))
+    inline_max_len = max(10, int(style_config['content_text_style']['inline_max_chara'] * 2 * TEXT_LAYOUT_COMPENSATION))
+    interline_size = style_config['content_text_style']['interline'] * TEXT_LAYOUT_COMPENSATION
     horizontal_align = style_config['content_text_style']['horizontal_align']
     text_color = style_config['content_text_style']['font_color']
     enable_stroke = style_config['content_text_style']['enable_stroke']
@@ -215,9 +376,8 @@ def create_video_segment(clip_config, style_config, resolution):
     default_bg_path = style_config['asset_paths']['content_bg']
     override_content_bg = style_config['options'].get('override_content_default_bg', False)
 
-    bg_video = VideoFileClip("./static/assets/bg_clips/black_bg.mp4")
-    bg_video = bg_video.with_effects([vfx.Loop(duration=clip_config['duration']), 
-                                      vfx.Resize(width=resolution[0])])
+    # Use an in-memory pure black clip instead of decoding a black mp4 every frame.
+    bg_video = ColorClip(size=resolution, color=(0, 0, 0)).with_duration(clip_config['duration'])
     
     # 检查成绩图片是否存在
     if 'main_image' in clip_config and os.path.exists(clip_config['main_image']):
@@ -307,21 +467,22 @@ def create_video_segment(clip_config, style_config, resolution):
 
     # 计算位置
     video_pos = (int(0.092 * resolution[0]), int(0.328 * resolution[1]))
-    text_pos = (int(0.54 * resolution[0]), int(0.54 * resolution[1]))
+    text_pos = (int(0.54 * resolution[0]), int(0.5 * resolution[1]))
 
     # 创建文字
     text_list = get_splited_text(clip_config['text'], text_max_bytes=inline_max_len)
-    txt_clip = TextClip(font=font_path, text="\n".join(text_list),
-                        method = "label",
-                        font_size=text_size,
-                        margin=(20, 20),
-                        interline=interline_size,
-                        text_align=horizontal_align,
-                        vertical_align="top",
-                        color=text_color,
-                        stroke_color = None if not enable_stroke else stroke_color,
-                        stroke_width = 0 if not enable_stroke else stroke_width,
-                        duration=clip_config['duration'])
+    txt_clip = create_text_image_clip(
+        text="\n".join(text_list),
+        font_path=font_path,
+        font_size=text_size,
+        margin=(20, 20),
+        interline=interline_size,
+        text_align=horizontal_align,
+        color=text_color,
+        stroke_color=None if not enable_stroke else stroke_color,
+        stroke_width=0 if not enable_stroke else stroke_width,
+        duration=clip_config['duration'],
+    )
 
     # 视频叠放顺序，从下往上：背景底图，谱面预览，图片（带有透明通道），文字
     composite_clip = CompositeVideoClip([
@@ -570,23 +731,29 @@ def get_combined_ending_clip(ending_clips, combined_start_time, trans_time):
     return combined_clip
 
 
-def render_all_video_clips(resources, style_config,
-                           video_output_path, video_res, video_bitrate,
-                           auto_add_transition=True, trans_time=1, force_render=False):
-    vfile_prefix = 0
+def _render_single_clip_task(task):
+    clip_type = task["clip_type"]
+    config = task["config"]
+    style_config = task["style_config"]
+    video_res = tuple(task["video_res"])
+    video_output_path = task["video_output_path"]
+    prefix = task["prefix"]
+    force_render = task["force_render"]
+    auto_add_transition = task["auto_add_transition"]
+    trans_time = task["trans_time"]
+    writer_kwargs = get_writer_kwargs(task["video_bitrate"], task["video_codec"])
 
-    def modify_and_rend_clip(clip, config, prefix, auto_add_transition, trans_time):
-        output_file = os.path.join(video_output_path, f"{prefix}_{config['id']}.mp4")
-        
-        # 检查文件是否已经存在
-        if os.path.exists(output_file) and not force_render:
-            print(f"视频文件{output_file}已存在，跳过渲染。如果需要强制覆盖已存在的文件，请设置勾选force_render")
-            clip.close()
-            del clip
-            return
-        
+    output_file = os.path.join(video_output_path, f"{prefix}_{config['id']}.mp4")
+    if os.path.exists(output_file) and not force_render:
+        return {"status": "skip", "output_file": output_file}
+
+    if clip_type == "main":
+        clip = create_video_segment(config, style_config, video_res)
+    else:
+        clip = create_info_segment(config, style_config, video_res)
+
+    try:
         clip = normalize_audio_volume(clip)
-        # 如果启用了自动添加转场效果，则在头尾加入淡入淡出
         if auto_add_transition:
             clip = clip.with_effects([
                 vfx.FadeIn(duration=trans_time),
@@ -594,43 +761,110 @@ def render_all_video_clips(resources, style_config,
                 afx.AudioFadeIn(duration=trans_time),
                 afx.AudioFadeOut(duration=trans_time)
             ])
-        # 直接渲染clip为视频文件
         print(f"正在合成视频片段: {prefix}_{config['id']}.mp4")
-        clip.write_videofile(output_file, fps=30, threads=4, preset='ultrafast', bitrate=video_bitrate)
+        clip.write_videofile(output_file, **writer_kwargs)
+        return {"status": "ok", "output_file": output_file}
+    finally:
         clip.close()
-        # 强制垃圾回收
-        del clip
+
+
+def render_all_video_clips(resources, style_config,
+                           video_output_path, video_res, video_bitrate,
+                           auto_add_transition=True, trans_time=1, force_render=False,
+                           video_codec="libx264", parallel_workers=1):
+    vfile_prefix = 0
 
     if not 'main' in resources:
         print("Error: 没有找到主视频片段的配置！请检查配置文件！")
         return
 
+    tasks = []
+
     if 'intro' in resources:
         for clip_config in resources['intro']:
-            clip = create_info_segment(clip_config, style_config, video_res)
-            clip = modify_and_rend_clip(clip, clip_config, vfile_prefix, auto_add_transition, trans_time)
+            tasks.append({
+                "clip_type": "intro",
+                "config": clip_config,
+                "style_config": style_config,
+                "video_res": video_res,
+                "video_output_path": video_output_path,
+                "prefix": vfile_prefix,
+                "force_render": force_render,
+                "auto_add_transition": auto_add_transition,
+                "trans_time": trans_time,
+                "video_bitrate": video_bitrate,
+                "video_codec": video_codec,
+            })
             vfile_prefix += 1
 
     main_resources = list(reversed(resources['main']))
     for clip_config in main_resources:
-        clip = create_video_segment(clip_config, style_config, video_res)
-        clip = modify_and_rend_clip(clip, clip_config, vfile_prefix, auto_add_transition, trans_time)
-
+        tasks.append({
+            "clip_type": "main",
+            "config": clip_config,
+            "style_config": style_config,
+            "video_res": video_res,
+            "video_output_path": video_output_path,
+            "prefix": vfile_prefix,
+            "force_render": force_render,
+            "auto_add_transition": auto_add_transition,
+            "trans_time": trans_time,
+            "video_bitrate": video_bitrate,
+            "video_codec": video_codec,
+        })
         vfile_prefix += 1
 
     if 'ending' in resources:
         for clip_config in resources['ending']:
-            clip = create_info_segment(clip_config, style_config, video_res)
-            clip = modify_and_rend_clip(clip, clip_config, vfile_prefix, auto_add_transition, trans_time)
+            tasks.append({
+                "clip_type": "ending",
+                "config": clip_config,
+                "style_config": style_config,
+                "video_res": video_res,
+                "video_output_path": video_output_path,
+                "prefix": vfile_prefix,
+                "force_render": force_render,
+                "auto_add_transition": auto_add_transition,
+                "trans_time": trans_time,
+                "video_bitrate": video_bitrate,
+                "video_codec": video_codec,
+            })
             vfile_prefix += 1
 
+    workers = max(1, int(parallel_workers))
+    workers = min(workers, max(1, len(tasks)))
+    if workers == 1:
+        for task in tasks:
+            _render_single_clip_task(task)
+        return
 
-def render_one_video_clip(config, style_config, video_file_name, video_output_path, video_res, video_bitrate):
+    # On Windows/Streamlit, process pools are unstable; prefer threads there.
+    use_thread_pool = os.name == "nt"
+    executor_cls = ThreadPoolExecutor if use_thread_pool else ProcessPoolExecutor
+    backend_name = "线程" if use_thread_pool else "进程"
+    print(f"启用并行渲染（{backend_name}池），并发数: {workers}")
+
+    try:
+        with executor_cls(max_workers=workers) as executor:
+            futures = [executor.submit(_render_single_clip_task, task) for task in tasks]
+            for future in as_completed(futures):
+                _ = future.result()
+    except BrokenProcessPool as e:
+        print(f"Warning: 进程池异常终止，将自动回退到串行渲染。详情: {e}")
+        for task in tasks:
+            _render_single_clip_task(task)
+    except Exception as e:
+        print(f"Error: 并行渲染失败: {e}")
+        raise
+
+
+def render_one_video_clip(config, style_config, video_file_name, video_output_path, video_res, video_bitrate,
+                          video_codec="libx264"):
     print(f"正在合成视频片段: {video_file_name}")
     try:
         clip = create_video_segment(config, style_config, video_res)
-        clip.write_videofile(os.path.join(video_output_path, video_file_name), 
-                             fps=30, threads=4, preset='ultrafast', bitrate=video_bitrate)
+        writer_kwargs = get_writer_kwargs(video_bitrate, video_codec)
+        clip.write_videofile(os.path.join(video_output_path, video_file_name), **writer_kwargs)
         clip.close()
         return {"status": "success", "info": f"合成视频片段{video_file_name}成功"}
     except Exception as e:
@@ -640,7 +874,8 @@ def render_one_video_clip(config, style_config, video_file_name, video_output_pa
     
 def render_complete_full_video(configs, style_config, username,
                             video_output_path, video_res, video_bitrate,
-                            video_trans_enable, video_trans_time, full_last_clip):
+                            video_trans_enable, video_trans_time, full_last_clip,
+                            video_codec="libx264"):
     print(f"正在合成完整视频")
     try:
         final_video = create_full_video(configs, 
@@ -649,8 +884,8 @@ def render_complete_full_video(configs, style_config, username,
                                         auto_add_transition=video_trans_enable, 
                                         trans_time=video_trans_time, 
                                         full_last_clip=full_last_clip)
-        final_video.write_videofile(os.path.join(video_output_path, f"{username}_FULL_VIDEO.mp4"), 
-                                    fps=30, threads=4, preset='ultrafast', bitrate=video_bitrate)
+        writer_kwargs = get_writer_kwargs(video_bitrate, video_codec)
+        final_video.write_videofile(os.path.join(video_output_path, f"{username}_FULL_VIDEO.mp4"), **writer_kwargs)
         final_video.close()
         return {"status": "success", "info": f"合成完整视频成功"}
     except Exception as e:
@@ -758,4 +993,3 @@ def combine_full_video_ffmpeg_concat_gl(video_clip_path, resolution, trans_name=
     os.system(cmd)
 
     return output_path
-

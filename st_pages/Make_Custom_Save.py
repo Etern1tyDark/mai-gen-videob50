@@ -40,6 +40,190 @@ def load_songs_data():
 songs_data = load_songs_data()
 maimai_level_label_list = list(LEVEL_LABELS.values())
 
+SNAPSHOT_DIFFICULTY_MAP = {
+    "basic": "BASIC",
+    "advanced": "ADVANCED",
+    "expert": "EXPERT",
+    "master": "MASTER",
+    "remaster": "RE:MASTER",
+    "re:master": "RE:MASTER",
+}
+
+SNAPSHOT_FC_MAP = {
+    "": "",
+    "none": "",
+    "fc": "fc",
+    "fc+": "fcp",
+    "fcp": "fcp",
+    "ap": "ap",
+    "ap+": "app",
+    "app": "app",
+}
+
+SNAPSHOT_FS_MAP = {
+    "": "",
+    "none": "",
+    "sync": "sync",
+    "fs": "fs",
+    "fs+": "fsp",
+    "fsp": "fsp",
+    "fdx": "fsd",
+    "fsd": "fsd",
+    "fdx+": "fsdp",
+    "fsd+": "fsdp",
+    "fsdp": "fsdp",
+}
+
+
+@st.cache_data
+def build_song_lookup(songs):
+    by_name_type = {}
+    by_name_artist_type = {}
+    by_name_any = {}
+    by_nimg = {}
+    by_dimg = {}
+
+    for song in songs:
+        name = (song.get("name") or "").strip()
+        artist = (song.get("artist") or "").strip()
+        song_type = song.get("type", None)
+
+        if name:
+            by_name_any.setdefault(name.lower(), song)
+            if song_type is not None:
+                by_name_type.setdefault((name.lower(), song_type), song)
+            if artist and song_type is not None:
+                by_name_artist_type.setdefault((name.lower(), artist.lower(), song_type), song)
+
+        nimg = song.get("nimg", None)
+        if nimg:
+            by_nimg.setdefault(nimg, song)
+
+        dimg = song.get("dimg", None)
+        if dimg:
+            by_dimg.setdefault(dimg, song)
+
+    return {
+        "by_name_type": by_name_type,
+        "by_name_artist_type": by_name_artist_type,
+        "by_name_any": by_name_any,
+        "by_nimg": by_nimg,
+        "by_dimg": by_dimg,
+    }
+
+
+def normalize_snapshot_type(snapshot_type: str) -> str:
+    if (snapshot_type or "").lower() == "std":
+        return "SD"
+    return "DX"
+
+
+def normalize_snapshot_difficulty(difficulty: str) -> str:
+    if not difficulty:
+        return "MASTER"
+    return SNAPSHOT_DIFFICULTY_MAP.get(difficulty.lower(), difficulty.upper())
+
+
+def normalize_snapshot_fc(fc_value: str) -> str:
+    return SNAPSHOT_FC_MAP.get((fc_value or "").lower(), "")
+
+
+def normalize_snapshot_fs(fs_value: str) -> str:
+    return SNAPSHOT_FS_MAP.get((fs_value or "").lower(), "")
+
+
+def parse_snapshot_achievement(achievement_raw) -> float:
+    if achievement_raw is None:
+        return 0.0
+    try:
+        achievement_value = float(achievement_raw)
+    except (ValueError, TypeError):
+        return 0.0
+    if achievement_value >= 1000:
+        return round(achievement_value / 10000, 4)
+    return float(achievement_value)
+
+
+def parse_snapshot_ds(snapshot_song, fallback_level: str) -> float:
+    level_precise = snapshot_song.get("levelPrecise", None)
+    if level_precise is not None:
+        try:
+            return float(level_precise) / 10.0
+        except (ValueError, TypeError):
+            pass
+    if not fallback_level:
+        return 0.0
+    try:
+        if "+" in fallback_level:
+            return float(fallback_level.replace("+", ".6"))
+        return float(fallback_level)
+    except ValueError:
+        return 0.0
+
+
+def resolve_snapshot_song(snapshot_song, lookup_cache):
+    title = (snapshot_song.get("songName") or "").strip()
+    artist = (snapshot_song.get("artist") or "").strip()
+    snapshot_type = (snapshot_song.get("type") or "").lower()
+    song_type = 1 if snapshot_type == "dx" else 0
+
+    song_meta = None
+    if title and artist:
+        song_meta = lookup_cache["by_name_artist_type"].get((title.lower(), artist.lower(), song_type), None)
+    if not song_meta and title:
+        song_meta = lookup_cache["by_name_type"].get((title.lower(), song_type), None)
+    if not song_meta and snapshot_song.get("cover"):
+        cover_hash = os.path.splitext(snapshot_song["cover"].split("/")[-1])[0]
+        if cover_hash:
+            song_meta = lookup_cache["by_nimg"].get(cover_hash, None) or lookup_cache["by_dimg"].get(cover_hash, None)
+    if not song_meta and title:
+        song_meta = lookup_cache["by_name_any"].get(title.lower(), None)
+
+    return song_meta
+
+
+def create_record_from_snapshot(snapshot_song, index, lookup_cache):
+    record = create_empty_record(index)
+    difficulty_label = normalize_snapshot_difficulty(snapshot_song.get("difficulty", ""))
+    level_index = maimai_level_label_list.index(difficulty_label) if difficulty_label in maimai_level_label_list else 3
+    song_meta = resolve_snapshot_song(snapshot_song, lookup_cache)
+
+    record["type"] = normalize_snapshot_type(snapshot_song.get("type", "dx"))
+    if song_meta and song_meta.get("type", None) is not None:
+        record["type"] = "DX" if song_meta["type"] == 1 else "SD"
+
+    title = (snapshot_song.get("songName") or "").strip()
+    if song_meta and song_meta.get("name"):
+        title = song_meta.get("name")
+    if not title:
+        title = f"Unknown Song {index}"
+
+    record["title"] = title
+    record["level_label"] = difficulty_label
+    record["level_index"] = level_index
+
+    if song_meta and level_index < len(song_meta.get("charts", [])):
+        ds = song_meta["charts"][level_index].get("level", 0.0)
+    else:
+        ds = parse_snapshot_ds(snapshot_song, snapshot_song.get("level", ""))
+    record["ds"] = float(ds) if ds is not None else 0.0
+    record["level"] = parse_level(record["ds"]) if record["ds"] else (snapshot_song.get("level") or "0")
+
+    record["achievements"] = parse_snapshot_achievement(snapshot_song.get("achievement", 0))
+    record["rate"] = get_rate(record["achievements"])
+    record["ra"] = compute_rating(record["ds"], record["achievements"])
+    record["dxScore"] = int(snapshot_song.get("dxScore", 0) or 0)
+    record["fc"] = normalize_snapshot_fc(snapshot_song.get("fc", ""))
+    record["fs"] = normalize_snapshot_fs(snapshot_song.get("fs", ""))
+    record["playCount"] = int(snapshot_song.get("playCount", 0) or 0)
+
+    try:
+        record["song_id"] = format_record_songid(record, song_meta.get("id", None) if song_meta else None)
+    except Exception:
+        record["song_id"] = -1
+
+    return record
+
 # Create empty record template
 def create_empty_record(index):
     prefix = st.session_state.generate_setting.get("clip_prefix", "Clip")
@@ -405,6 +589,40 @@ def clear_all_records():
     save_custom_config()
 
 
+def apply_snapshot_to_session(snapshot_data):
+    if not snapshot_data or not isinstance(snapshot_data, dict):
+        st.error("Snapshot JSON is empty or invalid.")
+        return
+    snapshot_songs = snapshot_data.get("songs", [])
+    if not isinstance(snapshot_songs, list) or not snapshot_songs:
+        st.error("Snapshot JSON does not contain any songs.")
+        return
+
+    lookup_cache = build_song_lookup(songs_data)
+    records = []
+    for index, song in enumerate(snapshot_songs, start=1):
+        try:
+            record = create_record_from_snapshot(song, index, lookup_cache)
+            records.append(record)
+        except Exception as e:
+            st.warning(f"Skipped a song at index {index}: {e}")
+
+    if not records:
+        st.error("No valid records were created from the snapshot.")
+        return
+
+    st.session_state.records = records
+    current_config = st.session_state.custom_config
+    current_config["records"] = records
+    current_config["length_of_content"] = len(records)
+    current_config["rating"] = snapshot_data.get("metadata", {}).get("rating", current_config.get("rating", 0))
+    current_config["sub_type"] = "custom"
+    st.session_state.custom_config = current_config
+
+    save_custom_config()
+    st.success(f"Imported {len(records)} records from snapshot JSON.")
+
+
 # Username input section
 if not st.session_state.get("username", None):
     with st.container(border=True):
@@ -488,7 +706,45 @@ if st.session_state.get("username", None):
         st.session_state.custom_config = create_empty_config(st.session_state.get("username", ""))
         st.session_state.records = []
 
-if st.session_state.get("username", None) and st.session_state.get("save_id", None):
+if st.session_state.get("username", None):
+    with st.expander("Import from snapshot JSON", expanded=False):
+        st.write("Import records from a maimai DX NET snapshot JSON.")
+        upload_tab, path_tab = st.tabs(["Upload file", "Load from path"])
+
+        with upload_tab:
+            uploaded_snapshot = st.file_uploader(
+                "Snapshot JSON file",
+                type=["json"],
+                key="snapshot_upload",
+                accept_multiple_files=False
+            )
+            if st.button("Import uploaded snapshot", disabled=uploaded_snapshot is None, key="import_snapshot_upload"):
+                try:
+                    snapshot_data = json.load(uploaded_snapshot)
+                    apply_snapshot_to_session(snapshot_data)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to import snapshot: {e}")
+
+        with path_tab:
+            default_snapshot_path = "./snapshot-2oktr43tPjuRjCqJqMznK.json"
+            snapshot_path = st.text_input(
+                "Snapshot JSON path (server-side)",
+                value=default_snapshot_path,
+                key="snapshot_path_input"
+            )
+            if st.button("Import snapshot from path", key="import_snapshot_path"):
+                if not os.path.exists(snapshot_path):
+                    st.error("Snapshot file not found at the provided path.")
+                else:
+                    try:
+                        with open(snapshot_path, "r", encoding="utf-8") as f:
+                            snapshot_data = json.load(f)
+                        apply_snapshot_to_session(snapshot_data)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to import snapshot: {e}")
+
     # Edit basic save information
     st.write("Click the button below to edit the basic information of this save")
     if st.button("Edit basic save information"):
