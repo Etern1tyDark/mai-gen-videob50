@@ -2,11 +2,12 @@ import json
 import unicodedata
 from pathlib import Path
 
-root = Path(r"C:\Data\games\RGs\maimai\mai-gen-videob50-release_v06_5_bugfix\mai-gen-videob50-release_v06_5_bugfix")
+DEFAULT_ROOT = Path(r"C:\Data\games\RGs\maimai\mai-gen-videob50-release_v06_5_bugfix\mai-gen-videob50-release_v06_5_bugfix")
+root = DEFAULT_ROOT if DEFAULT_ROOT.exists() else Path(__file__).resolve().parent
 
-snapshot_path = root / "snapshot-2oktr43tPjuRjCqJqMznK.json"
-config_path = root / "b50_datas" / "Eter" / "20260126_181704" / "b50_config.json"
-raw_path = root / "b50_datas" / "Eter" / "20260126_181704" / "b50_raw.json"
+snapshot_path = root / "snapshot-x-mzJm4kcKGWVagF5wY9N.json"
+config_path = root / "b50_datas" / "Twi" / "20260307_205627" / "b50_config.json"
+raw_path = root / "b50_datas" / "Twi" / "20260307_205627" / "b50_raw.json"
 
 snapshot = json.loads(snapshot_path.read_text(encoding="utf-8-sig"))
 config = json.loads(config_path.read_text(encoding="utf-8-sig"))
@@ -100,6 +101,8 @@ def build_lookup(songs):
             "fc": normalize_fc(s.get("fc")),
             "fs": normalize_fs(s.get("fs")),
             "achievement": parse_achievement(s.get("achievement")),
+            "levelPrecise": s.get("levelPrecise"),
+            "rating": s.get("rating"),
         }
         full_key = (name, diff, typ, level)
         full[full_key] = entry
@@ -152,6 +155,24 @@ def update_record(rec, full, by_title, by_title_diff, by_title_diff_type):
     if not (rec.get("fs") or "").strip() and entry.get("fs"):
         rec["fs"] = entry["fs"]
         changed = True
+    level_precise = entry.get("levelPrecise")
+    if level_precise is not None:
+        try:
+            ds = float(level_precise) / 10.0
+        except (TypeError, ValueError):
+            ds = None
+        if ds is not None and rec.get("ds") != ds:
+            rec["ds"] = ds
+            changed = True
+    rating = entry.get("rating")
+    if rating is not None:
+        try:
+            ra = int(rating)
+        except (TypeError, ValueError):
+            ra = None
+        if ra is not None and rec.get("ra") != ra:
+            rec["ra"] = ra
+            changed = True
     return changed
 
 
@@ -169,6 +190,18 @@ for rec in raw.get("charts", {}).get("dx", []):
 for rec in raw.get("charts", {}).get("sd", []):
     if update_record(rec, full, by_title, by_title_diff, by_title_diff_type):
         changed += 1
+
+snapshot_rating = snapshot.get("rating")
+if snapshot_rating is None and isinstance(snapshot.get("metadata"), dict):
+    snapshot_rating = snapshot["metadata"].get("rating")
+if snapshot_rating is not None:
+    try:
+        rating_value = int(snapshot_rating)
+    except (TypeError, ValueError):
+        rating_value = None
+    if rating_value is not None:
+        config["rating"] = rating_value
+        raw["rating"] = rating_value
 
 config_path.write_text(json.dumps(config, ensure_ascii=False, indent=4), encoding="utf-8")
 raw_path.write_text(json.dumps(raw, ensure_ascii=False, indent=4), encoding="utf-8")

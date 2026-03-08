@@ -3,8 +3,8 @@ from pathlib import Path
 
 root = Path(r"C:\Data\games\RGs\maimai\mai-gen-videob50-release_v06_5_bugfix\mai-gen-videob50-release_v06_5_bugfix")
 
-config_path = root / "b50_datas" / "Eter" / "20260126_181704" / "b50_config.json"
-raw_path = root / "b50_datas" / "Eter" / "20260126_181704" / "b50_raw.json"
+config_path = root / "b50_datas" / "Twi" / "20260307_205627" / "b50_config.json"
+raw_path = root / "b50_datas" / "Twi" / "20260307_205627" / "b50_raw.json"
 
 
 def load_json(path: Path):
